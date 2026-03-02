@@ -1,45 +1,35 @@
-// api/framer-newsletter.js
+export const config = {
+  api: { bodyParser: false },
+};
+
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      return res.status(405).send("Method Not Allowed");
+    const raw = await readRawBody(req);
+    const text = raw.toString("utf8");
+
+    console.log("=== FRAMER WEBHOOK DEBUG ===");
+    console.log("METHOD:", req.method);
+    console.log("HEADERS:", JSON.stringify(req.headers));
+    console.log("RAW BODY:", text);
+
+    // prova anche a parsare JSON se lo è
+    try {
+      const parsed = JSON.parse(text);
+      console.log("PARSED JSON:", JSON.stringify(parsed));
+    } catch {
+      console.log("PARSED JSON: (not valid JSON)");
     }
 
-    const body = req.body;
-
-    const email =
-      body?.email ||
-      body?.fields?.email ||
-      body?.data?.email;
-
-    if (!email) {
-      return res.status(400).json({ error: "Missing email" });
-    }
-
-    // 🚨 QUI NON CI SONO IF CHE BLOCCANO
-    const r = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-      },
-      body: JSON.stringify({
-        from: process.env.MAIL_FROM,
-        to: email,
-        subject: "Grazie per esserti iscritto!",
-        html: "<p>Iscrizione confermata 👋</p>",
-      }),
-    });
-
-    const responseText = await r.text();
-    console.log("RESEND STATUS:", r.status);
-    console.log("RESEND RESPONSE:", responseText);
-
+    // IMPORTANT: rispondi 200 così Framer non blocca il submit
     return res.status(200).json({ ok: true });
-
   } catch (err) {
-    console.error("Webhook crash:", err);
-    return res.status(500).json({ error: "Server error" });
+    console.error("DEBUG ERROR:", err);
+    return res.status(200).json({ ok: true });
   }
 }

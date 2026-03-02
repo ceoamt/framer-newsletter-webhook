@@ -1,93 +1,87 @@
 // api/framer-newsletter.js
+import crypto from "crypto";
 
-function pickEmail(payload) {
-  const candidates = [
-    payload?.email,
-    payload?.Email,
-    payload?.fields?.email,
-    payload?.fields?.Email,
-    payload?.data?.email,
-    payload?.data?.Email,
-  ].filter(Boolean);
+function isWebhookSignatureValid(secret, submissionId, payloadBuffer, signature) {
+  if (!secret || !submissionId || !payloadBuffer || !signature) return false;
+  if (typeof signature !== "string" || !signature.startsWith("sha256=")) return false;
 
-  if (candidates[0]) return candidates[0];
+  const hmac = crypto.createHmac("sha256", secret);
+  hmac.update(payloadBuffer);
+  hmac.update(submissionId);
 
-  // fallback: cerca una stringa che sembri email in tutto il payload
-  const allStrings = JSON.stringify(payload).match(
-    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
-  );
-  return allStrings?.[0] || null;
+  const expected = "sha256=" + hmac.digest("hex");
+
+  // timing-safe compare
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
-function getProvidedSecret(req, body) {
-  // 1) Authorization: Bearer <secret>
-  const authHeader = req.headers["authorization"] || "";
-  const secretFromAuth = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-
-  // 2) Alcuni header possibili (Framer o reverse proxies)
-  const secretFromHeader =
-    req.headers["x-framer-secret"] ||
-    req.headers["x-webhook-secret"] ||
-    req.headers["x-hook-secret"] ||
-    req.headers["x-framer-webhook-secret"];
-
-  // 3) Possibili campi nel body
-  const secretFromBody =
-    body?.secret ||
-    body?.webhookSecret ||
-    body?.token ||
-    body?.auth ||
-    body?.authorization;
-
-  return secretFromAuth || secretFromHeader || secretFromBody || null;
+function pickEmail(payload) {
+  return (
+    payload?.email ||
+    payload?.Email ||
+    payload?.fields?.email ||
+    payload?.fields?.Email ||
+    payload?.data?.email ||
+    payload?.data?.Email ||
+    null
+  );
 }
 
 function isValidEmail(email) {
-  // Validazione semplice (abbastanza per un form)
   return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
 }
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      return res.status(405).send("Method Not Allowed");
+    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+
+    // 1) Read raw body (IMPORTANT for signature verification)
+    const rawBody = await readRawBody(req);
+
+    // 2) Verify Framer signature
+    const signature = req.headers["framer-signature"];
+    const submissionId = req.headers["framer-webhook-submission-id"];
+    const secret = process.env.FRAMER_WEBHOOK_SECRET;
+
+    if (!secret) {
+      return res.status(500).json({ error: "Server misconfigured: FRAMER_WEBHOOK_SECRET missing" });
     }
 
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-
-    // --- AUTH ---
-    const expected = process.env.FRAMER_WEBHOOK_SECRET;
-    const provided = getProvidedSecret(req, body);
-
-    // Se hai impostato FRAMER_WEBHOOK_SECRET, allora lo richiediamo.
-    if (expected && provided !== expected) {
-      return res.status(401).json({
-        error: "Unauthorized",
-        hint: "Webhook secret missing or invalid",
-      });
+    const okSig = isWebhookSignatureValid(secret, submissionId, rawBody, signature);
+    if (!okSig) {
+      // This is exactly what Framer complains about as “requires authentication”
+      return res.status(401).json({ error: "Unauthorized", hint: "Invalid Framer signature" });
     }
 
-    // --- INPUT ---
+    // 3) Parse JSON payload
+    let body;
+    try {
+      body = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+      return res.status(400).json({ error: "Invalid JSON payload" });
+    }
+
     const email = pickEmail(body);
-
     if (!isValidEmail(email)) {
-      return res.status(400).json({
-        error: "Missing or invalid email in payload",
-      });
+      return res.status(400).json({ error: "Missing or invalid email in payload" });
     }
 
-    // --- RESEND CONFIG ---
+    // 4) Send email via Resend
     const resendKey = process.env.RESEND_API_KEY;
     const from = process.env.MAIL_FROM;
 
-    if (!resendKey) {
-      return res.status(500).json({ error: "Server misconfigured: RESEND_API_KEY missing" });
-    }
-    if (!from) {
-      return res.status(500).json({ error: "Server misconfigured: MAIL_FROM missing" });
-    }
+    if (!resendKey) return res.status(500).json({ error: "Server misconfigured: RESEND_API_KEY missing" });
+    if (!from) return res.status(500).json({ error: "Server misconfigured: MAIL_FROM missing" });
 
-    // --- EMAIL CONTENT ---
     const subject = "Grazie per esserti iscritto!";
     const html = `
       <div style="font-family:-apple-system,Segoe UI,Roboto,Arial;line-height:1.6">
@@ -97,34 +91,23 @@ export default async function handler(req, res) {
       </div>
     `;
 
-    // --- SEND ---
     const r = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${resendKey}`,
       },
-      body: JSON.stringify({
-        from,
-        to: email,
-        subject,
-        html,
-      }),
+      body: JSON.stringify({ from, to: email, subject, html }),
     });
 
     if (!r.ok) {
       const details = await r.text();
-      return res.status(502).json({
-        error: "Resend error",
-        details,
-      });
+      return res.status(502).json({ error: "Resend error", details });
     }
 
+    // 5) Must return 2xx for Framer success
     return res.status(200).json({ ok: true });
   } catch (err) {
-    return res.status(500).json({
-      error: "Internal error",
-      details: err?.message || String(err),
-    });
+    return res.status(500).json({ error: "Internal error", details: err?.message || String(err) });
   }
 }

@@ -34,7 +34,7 @@ module.exports = async function handler(req, res) {
       return res.end("Server misconfigured");
     }
 
-    const html =<!DOCTYPE html>
+    const html =`<!DOCTYPE html>
 <html lang="it">
   <head>
     <meta charset="utf-8" />

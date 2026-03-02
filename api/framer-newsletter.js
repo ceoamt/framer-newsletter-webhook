@@ -11,7 +11,6 @@ function isWebhookSignatureValid(secret, submissionId, payloadBuffer, signature)
 
   const expected = "sha256=" + hmac.digest("hex");
 
-  // timing-safe compare
   const a = Buffer.from(signature);
   const b = Buffer.from(expected);
   if (a.length !== b.length) return false;
@@ -40,29 +39,40 @@ async function readRawBody(req) {
   return Buffer.concat(chunks);
 }
 
+async function sendWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // 1) Read raw body (IMPORTANT for signature verification)
+    // 1) Raw body (serve per la firma)
     const rawBody = await readRawBody(req);
 
-    // 2) Verify Framer signature
+    // 2) Headers Framer
     const signature = req.headers["framer-signature"];
     const submissionId = req.headers["framer-webhook-submission-id"];
-    const secret = process.env.FRAMER_WEBHOOK_SECRET;
 
+    const secret = process.env.FRAMER_WEBHOOK_SECRET;
     if (!secret) {
       return res.status(500).json({ error: "Server misconfigured: FRAMER_WEBHOOK_SECRET missing" });
     }
 
     const okSig = isWebhookSignatureValid(secret, submissionId, rawBody, signature);
     if (!okSig) {
-      // This is exactly what Framer complains about as “requires authentication”
+      // Questo causa il “requires authentication”
       return res.status(401).json({ error: "Unauthorized", hint: "Invalid Framer signature" });
     }
 
-    // 3) Parse JSON payload
+    // 3) Parse JSON
     let body;
     try {
       body = JSON.parse(rawBody.toString("utf8"));
@@ -72,15 +82,20 @@ export default async function handler(req, res) {
 
     const email = pickEmail(body);
     if (!isValidEmail(email)) {
-      return res.status(400).json({ error: "Missing or invalid email in payload" });
+      return res.status(400).json({ error: "Missing or invalid email" });
     }
 
-    // 4) Send email via Resend
+    // 4) Rispondi SUBITO 200 a Framer (così la conferma submit funziona sempre)
+    res.status(200).json({ ok: true });
+
+    // 5) Invio email (best effort)
     const resendKey = process.env.RESEND_API_KEY;
     const from = process.env.MAIL_FROM;
 
-    if (!resendKey) return res.status(500).json({ error: "Server misconfigured: RESEND_API_KEY missing" });
-    if (!from) return res.status(500).json({ error: "Server misconfigured: MAIL_FROM missing" });
+    if (!resendKey || !from) {
+      console.error("Missing RESEND_API_KEY or MAIL_FROM");
+      return;
+    }
 
     const subject = "Grazie per esserti iscritto!";
     const html = `
@@ -91,23 +106,32 @@ export default async function handler(req, res) {
       </div>
     `;
 
-    const r = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${resendKey}`,
-      },
-      body: JSON.stringify({ from, to: email, subject, html }),
-    });
+    try {
+      const r = await sendWithTimeout(
+        "https://api.resend.com/emails",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${resendKey}`,
+          },
+          body: JSON.stringify({ from, to: email, subject, html }),
+        },
+        4000 // 4s max, poi basta
+      );
 
-    if (!r.ok) {
-      const details = await r.text();
-      return res.status(502).json({ error: "Resend error", details });
+      if (!r.ok) {
+        const details = await r.text();
+        console.error("Resend error:", r.status, details);
+      }
+    } catch (e) {
+      console.error("Resend request failed:", e?.message || e);
     }
-
-    // 5) Must return 2xx for Framer success
-    return res.status(200).json({ ok: true });
   } catch (err) {
-    return res.status(500).json({ error: "Internal error", details: err?.message || String(err) });
+    // Se siamo qui, probabilmente non abbiamo ancora risposto.
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "Internal error", details: err?.message || String(err) });
+    }
+    console.error("Post-response error:", err?.message || err);
   }
 }
